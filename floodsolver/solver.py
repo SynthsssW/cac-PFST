@@ -1,11 +1,12 @@
-"""2D overland-flow solver: local-inertial shallow water (Bates, Horritt & Fewtrell 2010).
+"""2D overland-flow solver: local-inertial shallow water, theta-weighted
+(Bates, Horritt & Fewtrell 2010; de Almeida, Bates, Freer & Souvignet 2012).
 
-Implements SOLVER_SPEC.md v1.2. Pure numpy, SI units throughout.
+Implements SOLVER_SPEC.md v1.3. Pure numpy, SI units throughout.
 
 Face-flux storage: inside step() and run() the fluxes are kept on the PADDED face
-arrays of §2.5, qx (ny, nx+1) and qy (ny+1, nx), because open-edge faces carry their
-own q_old between steps (§4.1). Column/row 0 and nx/ny are the boundary faces; the
-interior slices qx[:, 1:-1] and qy[1:-1, :] are the §1 arrays (ny, nx-1) and (ny-1, nx).
+arrays of §2.5, qx (ny, nx+1) and qy (ny+1, nx). Column/row 0 and nx/ny are the
+boundary faces (§4.1); the interior slices qx[:, 1:-1] and qy[1:-1, :] are the §1
+arrays (ny, nx-1) and (ny-1, nx).
 """
 from dataclasses import dataclass, field
 
@@ -19,11 +20,13 @@ CLOSED_EDGES = {"N": "closed", "S": "closed", "E": "closed", "W": "closed"}
 # ---------------------------------------------------------------------------
 # §2.1–§2.3 face flux
 # ---------------------------------------------------------------------------
-def _momentum(q_old, eta_a, eta_b, z_a, z_b, n_a, n_b, dx, dt, g, h_min):
-    """§2.1 h_flow, §2.2 n_face, §2.3 semi-implicit momentum update.
+def _momentum(q_pad, eta_a, eta_b, z_a, z_b, n_a, n_b, dx, dt, g, h_min, theta):
+    """§2.1 h_flow, §2.2 n_face, §2.3 theta-weighted semi-implicit momentum update.
 
-    b is the +direction neighbour of a. Faces with h_flow < h_min get exactly 0.0
-    and skip the friction update.
+    Operates along axis 1: q_pad is a padded face array (..., m+1) whose interior
+    faces [..., 1:-1] lie between cells a = [..., :-1] and b = [..., 1:] of the
+    (..., m) cell arrays; b is the +direction neighbour. Returns the interior
+    q_new and h_flow. Faces with h_flow < h_min get exactly 0.0 and skip friction.
     """
     # §2.1
     h_flow = np.maximum(eta_a, eta_b) - np.maximum(z_a, z_b)
@@ -32,28 +35,26 @@ def _momentum(q_old, eta_a, eta_b, z_a, z_b, n_a, n_b, dx, dt, g, h_min):
     n_face = 0.5 * (n_a + n_b)
     # §2.3
     S = (eta_b - eta_a) / dx
+    q_old = q_pad[:, 1:-1]
+    # theta-weighted inertia: neighbours along the face direction; a boundary or
+    # dry neighbour is replaced by q_old itself
+    no_nb = np.zeros((wet.shape[0], 1), dtype=bool)
+    wet_minus = np.concatenate((no_nb, wet[:, :-1]), axis=1)
+    wet_plus = np.concatenate((wet[:, 1:], no_nb), axis=1)
+    q_old_minus = np.where(wet_minus, q_pad[:, :-2], q_old)
+    q_old_plus = np.where(wet_plus, q_pad[:, 2:], q_old)
+    q_in = theta * q_old + 0.5 * (1 - theta) * (q_old_minus + q_old_plus)
     hf = np.where(wet, h_flow, 1.0)  # dry faces: value unused, avoids dividing by 0
-    q_new = (q_old - g * hf * dt * S) / (1 + g * dt * n_face**2 * np.abs(q_old) / hf**(7 / 3))
-    return np.where(wet, q_new, 0.0)
+    q_new = (q_in - g * hf * dt * S) / (1 + g * dt * n_face**2 * np.abs(q_old) / hf**(7 / 3))
+    return np.where(wet, q_new, 0.0), np.where(wet, h_flow, 0.0)
 
 
-def _ghost_x(a):
-    """Pad a (ny, nx) cell field with one ghost column on each side (W, E)."""
-    return np.concatenate((a[:, :1], a, a[:, -1:]), axis=1)
-
-
-def _ghost_y(a):
-    """Pad a (ny, nx) cell field with one ghost row on each side (N, S)."""
-    return np.concatenate((a[:1, :], a, a[-1:, :]), axis=0)
-
-
-def _ghost_terrain(z_eff):
-    """§4.1 ghost terrain, z_ghost = 2*z_edge - z_interior_neighbour."""
-    zx = np.concatenate((2 * z_eff[:, :1] - z_eff[:, 1:2], z_eff,
-                         2 * z_eff[:, -1:] - z_eff[:, -2:-1]), axis=1)
-    zy = np.concatenate((2 * z_eff[:1, :] - z_eff[1:2, :], z_eff,
-                         2 * z_eff[-1:, :] - z_eff[-2:-1, :]), axis=0)
-    return zx, zy
+def _outfall(h_edge, z_edge, z_interior_neighbour, n_edge, dx, h_min):
+    """§4.1 open edge: explicit Manning normal-depth outflow magnitude (>= 0)."""
+    S_out = (z_interior_neighbour - z_edge) / dx
+    flowing = (S_out > 0) & (h_edge >= h_min)
+    q_out = np.where(flowing, h_edge**(5 / 3) * np.sqrt(np.maximum(S_out, 0.0)) / n_edge, 0.0)
+    return q_out, np.where(flowing, h_edge, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -65,12 +66,15 @@ def step(h, qx, qy, z_eff, n, dx, dt, rain, params, bc, state):
     h        (ny, nx) depth at the start of the step
     qx, qy   padded face fluxes (ny, nx+1), (ny+1, nx) from the previous step
     rain     scalar or (ny, nx), m/s, held constant over the step
-    params   dict: g, h_min
+    params   dict: g, h_min, theta
     bc       dict: edges, surge_mask, surge_fn, culverts, Ia, f_c
-    state    dict: t, P_cum, h_max, eta_max, budget (§6 volumes); not modified in place
+    state    dict: t, P_cum, h_max, eta_max, budget (§6 volumes); not modified in place.
+             Returned state also holds hflow_x, hflow_y (padded): the h_flow behind each
+             face flux this step, used by the §2.7 time step of the next step.
     """
     g = params["g"]
     h_min = params["h_min"]
+    theta = params["theta"]
     edges = bc["edges"]
     open_w = edges["W"] == "open"
     open_e = edges["E"] == "open"
@@ -82,23 +86,35 @@ def step(h, qx, qy, z_eff, n, dx, dt, rain, params, bc, state):
     # 1. eta from the start-of-step depth
     eta = z_eff + h
 
-    # 2. h_flow, n_face, S for ALL faces, built on ghost-padded cells.
-    # §4.1 open-edge ghost: z_ghost extrapolated, h_ghost = h_edge (zero depth gradient).
-    zx, zy = _ghost_terrain(z_eff)
-    hx, hy = _ghost_x(h), _ghost_y(h)
-    etax, etay = zx + hx, zy + hy
-    nfx, nfy = _ghost_x(n), _ghost_y(n)
+    # 2.–3. interior faces: h_flow, n_face, S from this eta, then §2.3 momentum.
+    # x faces along axis 1; y faces use the same code on the transposed arrays.
+    ny, nx = h.shape
+    qx_new = np.zeros((ny, nx + 1))
+    qy_new = np.zeros((ny + 1, nx))
+    hflow_x = np.zeros((ny, nx + 1))
+    hflow_y = np.zeros((ny + 1, nx))
+    qx_new[:, 1:-1], hflow_x[:, 1:-1] = _momentum(
+        qx, eta[:, :-1], eta[:, 1:], z_eff[:, :-1], z_eff[:, 1:], n[:, :-1], n[:, 1:],
+        dx, dt, g, h_min, theta)
+    qy_t, hy_t = _momentum(
+        qy.T, eta.T[:, :-1], eta.T[:, 1:], z_eff.T[:, :-1], z_eff.T[:, 1:], n.T[:, :-1], n.T[:, 1:],
+        dx, dt, g, h_min, theta)
+    qy_new[1:-1, :], hflow_y[1:-1, :] = qy_t.T, hy_t.T
 
-    # 3. §2.3 momentum for every padded face, from the same eta
-    qx_new = _momentum(qx, etax[:, :-1], etax[:, 1:], zx[:, :-1], zx[:, 1:],
-                       nfx[:, :-1], nfx[:, 1:], dx, dt, g, h_min)
-    qy_new = _momentum(qy, etay[:-1, :], etay[1:, :], zy[:-1, :], zy[1:, :],
-                       nfy[:-1, :], nfy[1:, :], dx, dt, g, h_min)
-    # closed edges: 0.0; open edges: inward-pointing flux set to 0.0
-    qx_new[:, 0] = np.minimum(qx_new[:, 0], 0.0) if open_w else 0.0
-    qx_new[:, -1] = np.maximum(qx_new[:, -1], 0.0) if open_e else 0.0
-    qy_new[0, :] = np.minimum(qy_new[0, :], 0.0) if open_n else 0.0
-    qy_new[-1, :] = np.maximum(qy_new[-1, :], 0.0) if open_s else 0.0
+    # boundary faces (§4.1): closed -> 0.0; open -> explicit normal-depth outflow,
+    # signed to point out of the domain
+    if open_w:
+        q_o, hf_o = _outfall(h[:, 0], z_eff[:, 0], z_eff[:, 1], n[:, 0], dx, h_min)
+        qx_new[:, 0], hflow_x[:, 0] = -q_o, hf_o
+    if open_e:
+        q_o, hf_o = _outfall(h[:, -1], z_eff[:, -1], z_eff[:, -2], n[:, -1], dx, h_min)
+        qx_new[:, -1], hflow_x[:, -1] = q_o, hf_o
+    if open_n:
+        q_o, hf_o = _outfall(h[0, :], z_eff[0, :], z_eff[1, :], n[0, :], dx, h_min)
+        qy_new[0, :], hflow_y[0, :] = -q_o, hf_o
+    if open_s:
+        q_o, hf_o = _outfall(h[-1, :], z_eff[-1, :], z_eff[-2, :], n[-1, :], dx, h_min)
+        qy_new[-1, :], hflow_y[-1, :] = q_o, hf_o
 
     # 4. §2.4 per-cell limiter over the padded arrays (boundary faces included)
     V_out = dt * dx * ((np.maximum(qx_new[:, 1:], 0.0) + np.maximum(-qx_new[:, :-1], 0.0))
@@ -139,7 +155,7 @@ def step(h, qx, qy, z_eff, n, dx, dt, rain, params, bc, state):
                               np.where(remaining > 0, 0.0, 1.0))
     active = (h > 0) | (r > 0)
     f_dt = abstraction + np.where(active, bc["f_c"] * dt * frac_after, 0.0)
-    loss = np.minimum(f_dt, h_new)
+    loss = np.minimum(f_dt, np.maximum(h_new, 0.0))
     h_new = h_new - loss
     budget["infiltrated_volume"] += np.sum(loss) * dx**2
 
@@ -152,15 +168,18 @@ def step(h, qx, qy, z_eff, n, dx, dt, rain, params, bc, state):
         h_new[mask] = h_after
         budget["boundary_inflow_volume"] += np.sum(h_after - h_before) * dx**2
 
-    # 9. §5 culvert transfers, a -> b only
+    # 9. §5 culvert transfers, bidirectional; direction and head from start-of-step eta
     for ja, ia, jb, ib, A, C, z_inv in bc["culverts"]:
-        eta_a = z_eff[ja, ia] + h_new[ja, ia]
-        eta_b = z_eff[jb, ib] + h_new[jb, ib]
-        head = max(eta_a - eta_b, 0.0) if eta_a > z_inv else 0.0
+        if eta[ja, ia] >= eta[jb, ib]:
+            donor, receiver, key = (ja, ia), (jb, ib), "culvert_volume_ab"
+        else:
+            donor, receiver, key = (jb, ib), (ja, ia), "culvert_volume_ba"
+        head = eta[donor] - eta[receiver] if eta[donor] > z_inv else 0.0
         Q = C * A * np.sqrt(2 * g * head)
-        V = min(Q * dt, h_new[ja, ia] * dx**2)
-        h_new[ja, ia] -= V / dx**2
-        h_new[jb, ib] += V / dx**2
+        V = min(Q * dt, h_new[donor] * dx**2)
+        h_new[donor] -= V / dx**2
+        h_new[receiver] += V / dx**2
+        budget[key] += V
 
     # 10. clip h >= 0, record clipped volume
     budget["clipped_volume"] += np.sum(np.maximum(-h_new, 0.0)) * dx**2
@@ -174,13 +193,21 @@ def step(h, qx, qy, z_eff, n, dx, dt, rain, params, bc, state):
     budget["rain_volume"] += np.sum(rain_dt) * dx**2
 
     new_state = dict(state, t=state["t"] + dt, P_cum=P_cum, h_max=h_max, eta_max=eta_max,
-                     budget=budget, last_outflow_volume=v_out)
+                     budget=budget, last_outflow_volume=v_out, hflow_x=hflow_x, hflow_y=hflow_y)
     return h_new, qx_new, qy_new, new_state
 
 
 # ---------------------------------------------------------------------------
 # run()
 # ---------------------------------------------------------------------------
+def _u_max(q, h_flow, h_min):
+    """§2.7: max over faces of u_face = |q| / h_flow (0 where h_flow < h_min)."""
+    wet = h_flow >= h_min
+    if not wet.any():
+        return 0.0
+    return float(np.max(np.abs(q[wet]) / h_flow[wet]))
+
+
 @dataclass
 class Result:
     h_final: np.ndarray
@@ -197,7 +224,7 @@ class Result:
 def run(z, n, dx, rain_fn, t_end, *, rain_breakpoints=(), dz=None,
         edges=CLOSED_EDGES,
         surge_mask=None, surge_fn=None, culverts=(), Ia=None, f_c=None, h0=None,
-        alpha=0.7, h_min=1e-3, dt_min=0.01, dt_max=60.0, record_every=None):
+        alpha=0.7, theta=0.8, h_min=1e-3, dt_min=0.01, dt_max=60.0, record_every=None):
     """Run from t = 0 to t_end. Returns Result (§8).
 
     Result.qx, Result.qy are the §1 interior face arrays (ny, nx-1), (ny-1, nx).
@@ -213,7 +240,7 @@ def run(z, n, dx, rain_fn, t_end, *, rain_breakpoints=(), dz=None,
     qx = np.zeros((ny, nx + 1))
     qy = np.zeros((ny + 1, nx))
 
-    params = {"g": g, "h_min": h_min}
+    params = {"g": g, "h_min": h_min, "theta": theta}
     bc = {
         "edges": dict(CLOSED_EDGES, **edges),
         "surge_mask": None if surge_mask is None else np.asarray(surge_mask, dtype=bool),
@@ -228,7 +255,10 @@ def run(z, n, dx, rain_fn, t_end, *, rain_breakpoints=(), dz=None,
         "h_max": h.copy(),
         "eta_max": z_eff + h,
         "budget": {"rain_volume": 0.0, "infiltrated_volume": 0.0, "outflow_volume": 0.0,
-                   "boundary_inflow_volume": 0.0, "clipped_volume": 0.0},
+                   "boundary_inflow_volume": 0.0, "clipped_volume": 0.0,
+                   "culvert_volume_ab": 0.0, "culvert_volume_ba": 0.0},
+        "hflow_x": np.zeros((ny, nx + 1)),
+        "hflow_y": np.zeros((ny + 1, nx)),
     }
     t_wet_first = np.where(h > 0, 0.0, np.inf)
 
@@ -241,9 +271,10 @@ def run(z, n, dx, rain_fn, t_end, *, rain_breakpoints=(), dz=None,
 
     t = 0.0
     while t < t_end:
-        # §2.7 time step
+        # §2.7 time step, from the face arrays at the end of the previous step
+        u_max = max(_u_max(qx, state["hflow_x"], h_min), _u_max(qy, state["hflow_y"], h_min))
         h_ref = max(h.max(), h_min)
-        dt = alpha * dx / np.sqrt(g * h_ref)
+        dt = alpha * dx / (u_max + np.sqrt(g * h_ref))
         dt = float(np.clip(dt, dt_min, dt_max))
         while targets[k] <= t:
             k += 1
