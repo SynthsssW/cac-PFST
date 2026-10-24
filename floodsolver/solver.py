@@ -1,7 +1,7 @@
 """2D overland-flow solver: local-inertial shallow water, theta-weighted
 (Bates, Horritt & Fewtrell 2010; de Almeida, Bates, Freer & Souvignet 2012).
 
-Implements SOLVER_SPEC.md v1.3. Pure numpy, SI units throughout.
+Implements SOLVER_SPEC.md v1.4. Pure numpy, SI units throughout.
 
 Face-flux storage: inside step() and run() the fluxes are kept on the PADDED face
 arrays of §2.5, qx (ny, nx+1) and qy (ny+1, nx). Column/row 0 and nx/ny are the
@@ -224,7 +224,7 @@ class Result:
 def run(z, n, dx, rain_fn, t_end, *, rain_breakpoints=(), dz=None,
         edges=CLOSED_EDGES,
         surge_mask=None, surge_fn=None, culverts=(), Ia=None, f_c=None, h0=None,
-        alpha=0.7, theta=0.8, h_min=1e-3, dt_min=0.01, dt_max=60.0, record_every=None):
+        alpha=0.5, theta=0.8, h_min=1e-3, dt_min=0.01, dt_max=60.0, record_every=None):
     """Run from t = 0 to t_end. Returns Result (§8).
 
     Result.qx, Result.qy are the §1 interior face arrays (ny, nx-1), (ny-1, nx).
