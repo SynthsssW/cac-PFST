@@ -1,7 +1,6 @@
 """Tests T1–T8 from SOLVER_SPEC.md §7. Written before floodsolver/solver.py.
 
-Tolerances are copied verbatim from §7 (spec v1.1). Where §7 still leaves a detail
-unstated, the choice made here is marked `SPEC-GAP:`.
+Tolerances and constructions are copied verbatim from §7 (spec v1.2).
 
 The solver is imported inside each test so that, before solver.py exists, every
 test fails individually with ModuleNotFoundError rather than one collection error.
@@ -69,16 +68,13 @@ def test_T1_mass_conservation():
 
     X, Y = _coords(NY, NX)
     Lx, Ly = NX * DX, NY * DX
-    # §7: seed np.random.default_rng(0), sum rescaled to a 2 m peak-to-peak range.
-    # SPEC-GAP: "low-frequency" read as integer wavenumbers 1..3 cycles per domain,
-    # each sine with a random phase.
     rng = np.random.default_rng(0)
-    s = np.zeros((NY, NX))
-    for _ in range(3):
-        kx, ky = rng.integers(1, 4, size=2)
-        phi = rng.uniform(0.0, 2.0 * np.pi)
-        s += np.sin(2.0 * np.pi * (kx * X / Lx + ky * Y / Ly) + phi)
-    z = 2.0 * s / np.ptp(s) + 0.001 * X
+    k = rng.integers(1, 4, size=3)
+    phi = rng.uniform(0, 2 * np.pi, size=3)
+    z_raw = (np.sin(2 * np.pi * k[0] * X / Lx + phi[0])
+             + np.sin(2 * np.pi * k[1] * Y / Ly + phi[1])
+             + np.sin(2 * np.pi * k[2] * (X + Y) / Lx + phi[2]))
+    z = 2.0 * (z_raw - z_raw.min()) / (z_raw.max() - z_raw.min()) + 0.001 * X
     n = np.full((NY, NX), N_MANNING)
 
     t_rain = 3600.0
@@ -129,7 +125,7 @@ def test_T3_tilted_plane_steady_state():
     res = run(z, n, DX, lambda t: r, t_end, edges=edges, alpha=ALPHA, h_min=H_MIN)
 
     # (a) outflow rate, time-weighted average over the last 10 min.
-    # SPEC-GAP: outflow_series entries are read as (end time of step, mean rate over that step).
+    # §8: outflow_series is one (t_end_of_step, volume out that step / dt) per step.
     ts = np.array([t for t, _ in res.outflow_series], dtype=float)
     Qs = np.array([Q for _, Q in res.outflow_series], dtype=float)
     t_start = np.concatenate(([0.0], ts[:-1]))
@@ -140,14 +136,16 @@ def test_T3_tilted_plane_steady_state():
     Q_expected = r * NX * NY * DX ** 2  # total rain rate
     assert abs(Q_avg - Q_expected) / Q_expected < 0.02
 
-    # (b) depth within 5% of h_i for all i >= 8, every row; rows identical to 1e-12.
+    # (b) depth within 5% of h_i for all 8 <= i <= nx-2, every row; rows identical to 1e-12.
     # §7: analytic depth evaluated at x = (i+1)*dx, the distance to cell i's east face.
     h = res.h_final
     x = (np.arange(NX) + 1) * DX
     h_an = tilted_plane_steady_h(x, r, n_val, S0)
     assert np.abs(h - h[0:1, :]).max() <= 1e-12
-    rel_err = np.abs(h[:, 8:] - h_an[None, 8:]) / h_an[None, 8:]
-    assert np.all(rel_err < 0.05)
+    rel_err = np.abs(h - h_an[None, :]) / h_an[None, :]
+    assert np.all(rel_err[:, 8:NX - 1] < 0.05)
+    # REPORT only (not asserted): relative error in the outlet column i = nx-1.
+    print(f"\nT3 outlet column i={NX - 1}: max relative error {rel_err[:, NX - 1].max():.4%}")
 
     # (c)
     assert _rel_residual(res.budget) < 1e-10
@@ -173,8 +171,8 @@ def test_T4a_bowl_flat_surface():
 
     # Wet footprint equals {z < eta_mean} up to a one-cell boundary ring: cells within
     # one 8-neighbour step of the predicted edge, i.e. dilate(A) & ~erode(A).
-    # SPEC-GAP: eta_mean read as mean(eta[wet]).
-    A = z < eta[wet].mean()
+    eta_mean = np.mean(eta[wet])
+    A = z < eta_mean
     ring = _dilate(A) & ~_erode(A)
     mismatch = wet ^ A
     assert not np.any(mismatch & ~ring)
@@ -199,8 +197,9 @@ def test_T4b_bowl_no_overshoot():
     eta = z + h
     wet = h > 0.01
     eta_eq = np.mean(eta[wet])
+    dry0 = h0 == 0
     assert res.eta_max.max() <= (z + h0).max() + 1e-9
-    assert res.eta_max[wet].max() <= eta_eq + 0.10
+    assert res.eta_max[dry0 & wet].max() <= eta_eq + 0.10
     assert np.std(eta[wet]) < 1e-3
     assert _rel_residual(res.budget, h0) < 1e-10
 

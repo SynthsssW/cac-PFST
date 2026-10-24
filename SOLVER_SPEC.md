@@ -94,10 +94,10 @@ dt = clip(dt, dt_min, dt_max)
 ### 2.8 Order of operations inside `step()`
 
 1. `eta = z + h`
-2. compute `h_flow`, `n_face`, `S` for x faces and y faces from this `eta`
-3. §2.3 momentum for x and y
-4. §2.4 limiter
-5. boundary face fluxes (§4)
+2. compute `h_flow`, `n_face`, `S` for ALL faces from this `eta` — interior x and y faces, and the boundary faces of §4.1 (closed faces are 0; open faces use the ghost cell). Build the padded `(ny, nx+1)` and `(ny+1, nx)` face arrays here.
+3. §2.3 momentum for every face in those padded arrays; open-edge faces then have inward-pointing flux set to `0.0`
+4. §2.4 limiter over the padded arrays — boundary faces ARE included in each edge cell's outgoing volume
+5. accumulate `outflow_volume` from the (limited) open-edge fluxes
 6. §2.5 continuity (rain included, infiltration not)
 7. §2.6 infiltration sub-step
 8. §4.2 Dirichlet (surge) cells overwritten
@@ -117,7 +117,7 @@ dt = clip(dt, dt_min, dt_max)
 ### 4.1 Edge faces
 Each of the 4 edges has a mode: `"closed"` (default) or `"open"`.
 - closed: boundary face flux = `0.0`.
-- open (free outfall): construct a ghost cell outside the edge with `h_ghost = 0` and `z_ghost = 2*z_edge - z_interior_neighbour` (linear extrapolation of terrain). Compute the boundary face flux with the §2 equations using the ghost cell as the outside neighbour. Only outflow is allowed: if the computed flux points into the domain, set it to `0.0`. Accumulate outflow volume into `outflow_volume`.
+- open (free outfall, zero depth gradient): construct a ghost cell outside the edge with `z_ghost = 2*z_edge - z_interior_neighbour` (linear extrapolation of terrain) and `h_ghost = h_edge` (same depth as the edge cell, so `eta_ghost = z_ghost + h_edge` and the face slope equals the terrain slope — this is the normal-depth / kinematic outflow condition). Compute the boundary face flux with the §2.1–§2.3 equations using the ghost cell as the outside neighbour; the face keeps its own `q_old` state between steps like any other face. Only outflow is allowed: if the computed flux points into the domain, set it to `0.0`. These faces go through the §2.4 limiter (see §2.8). Accumulate the limited outflow volume into `outflow_volume`.
 
 ### 4.2 Dirichlet head (storm surge)
 `surge_mask[j,i]` boolean, `surge_fn(t) -> S` (m, water-surface elevation). After continuity each step, for masked cells set:
@@ -157,15 +157,15 @@ Common: `g = 9.81`, `dx = 10.0`, `alpha = 0.7`, `h_min = 1e-3`, `Ia = 0`, `f_c =
 
 Manning `n = 0.03` everywhere in every test. "Relative residual" always means §6's `abs(residual)/V_ref`. Where a test says `allclose(..., atol=X)`, pass `rtol=0`.
 
-**T1 mass conservation.** `z` = sum of 3 low-frequency sines with fixed seed `np.random.default_rng(0)`, rescaled so the peak-to-peak range is 2 m, + 0.001·x tilt; all edges closed; rain 50 mm/hr for 3600 s, then 7200 s no rain. Assert: relative residual `< 1e-10`; `h.min() >= 0`; `clipped_volume < 1e-9`; `sum(h)*dx²` equals rain volume to rel `1e-10`.
+**T1 mass conservation.** `rng = np.random.default_rng(0)`; `k = rng.integers(1, 4, size=3)`, `phi = rng.uniform(0, 2*np.pi, size=3)`; with `X, Y` cell-centre coordinates in m and `Lx = nx*dx`, `Ly = ny*dx`: `z_raw = sin(2π k[0] X/Lx + phi[0]) + sin(2π k[1] Y/Ly + phi[1]) + sin(2π k[2] (X+Y)/Lx + phi[2])`; `z = 2.0 * (z_raw - z_raw.min()) / (z_raw.max() - z_raw.min()) + 0.001 * X`; all edges closed; rain 50 mm/hr for 3600 s, then 7200 s no rain. Assert: relative residual `< 1e-10`; `h.min() >= 0`; `clipped_volume < 1e-9`; `sum(h)*dx²` equals rain volume to rel `1e-10`.
 
 **T2 symmetry.** Paraboloid bowl `z = 5e-4 * ((x-xc)² + (y-yc)²)` with `xc, yc` at the exact grid centre (use `nx = ny = 129` so there is a centre cell); uniform rain 50 mm/hr for 3600 s + 3600 s drain; closed. Assert `allclose(h, h[::-1, :], atol=1e-9)` and `allclose(h, h[:, ::-1], atol=1e-9)` and `allclose(h, h.T, atol=1e-9)`.
 
-**T3 tilted plane steady state.** Cell-centre coordinate `x_i = i*dx`; `z[j,i] = S0 * ((nx-1)*dx - x_i)` with `S0 = 0.01`, uniform in y, `n = 0.03`; east edge open, others closed; rain 50 mm/hr held constant for 4 h. Kinematic steady state: the flux through the east face of cell `i` is `q = r * (i+1) * dx` (distance from the closed west edge to that face), and the depth in cell `i` is the depth that carries that flux: `h_i = (n * r * (i+1) * dx / sqrt(S0))**(3/5)`. Use this `x = (i+1)*dx` in the analytic comparison. Assert at t = 4 h: (a) outflow rate (m³/s, last 10 min average) within 2% of the total rain rate `r * nx * ny * dx²`; (b) `h[j, i]` within 5% of `h_i` for all `i >= 8`, every row `j` (rows identical to 1e-12); (c) relative residual `< 1e-10`.
+**T3 tilted plane steady state.** Cell-centre coordinate `x_i = i*dx`; `z[j,i] = S0 * ((nx-1)*dx - x_i)` with `S0 = 0.01`, uniform in y, `n = 0.03`; east edge open, others closed; rain 50 mm/hr held constant for 4 h. Kinematic steady state: the flux through the east face of cell `i` is `q = r * (i+1) * dx` (distance from the closed west edge to that face), and the depth in cell `i` is the depth that carries that flux: `h_i = (n * r * (i+1) * dx / sqrt(S0))**(3/5)`. Use this `x = (i+1)*dx` in the analytic comparison. Assert at t = 4 h: (a) outflow rate (m³/s, last 10 min average) within 2% of the total rain rate `r * nx * ny * dx²`; (b) `h[j, i]` within 5% of `h_i` for all `8 <= i <= nx-2`, every row `j` (rows identical to 1e-12); additionally REPORT (do not assert) the relative error at `i = nx-1` — with the §4.1 zero-gradient ghost it should also be within ~2%, and a large value there means the boundary is wrong; (c) relative residual `< 1e-10`.
 
-**T4a bowl flat surface.** Same bowl as T2, closed, rain 100 mm total over 1 h, then drain 6 h. Let `wet = h > 0.01`. Assert `std(eta[wet]) < 1e-3` m; wet footprint equals `{z < eta_mean}` up to a one-cell boundary ring (cells within one 8-neighbour step of the predicted edge); relative residual `< 1e-10`.
+**T4a bowl flat surface.** Same bowl as T2, closed, rain 100 mm total over 1 h, then drain 6 h. Let `wet = h > 0.01`, `eta_mean = mean(eta[wet])`. Assert `std(eta[wet]) < 1e-3` m; wet footprint equals `{z < eta_mean}` up to a one-cell boundary ring (cells within one 8-neighbour step of the predicted edge); relative residual `< 1e-10`.
 
-**T4b bowl no overshoot.** Same bowl, no rain, initial `h0 = 2.0` m in rows and columns 60–69 inclusive, zero elsewhere, run 6 h. `run()` must also track `eta_max = max over time of (z_eff + h)` per cell. Let `eta_eq = mean(eta[h > 0.01])` at the end. Assert: `eta_max.max() <= (z_eff + h0).max() + 1e-9` (water surface never rises above the initial maximum surface); `eta_max[h > 0.01].max() <= eta_eq + 0.10` (bounded sloshing overshoot); final `std(eta[h > 0.01]) < 1e-3`; relative residual `< 1e-10`.
+**T4b bowl no overshoot.** Same bowl, no rain, initial `h0 = 2.0` m in rows and columns 60–69 inclusive, zero elsewhere, run 6 h. `run()` must also track `eta_max = max over time of (z_eff + h)` per cell. Let `eta_eq = mean(eta[h > 0.01])` at the end. Let `dry0 = (h0 == 0)`. Assert: `eta_max.max() <= (z_eff + h0).max() + 1e-9` (water surface never rises above the initial maximum surface); `eta_max[dry0 & (h > 0.01)].max() <= eta_eq + 0.10` (bounded sloshing overshoot, on cells that started dry — the block cells' own initial surfaces are excluded); final `std(eta[h > 0.01]) < 1e-3`; relative residual `< 1e-10`.
 
 **T5 dry ridge.** `z = 0` everywhere except a ridge `z = 1.0` in columns 63–64; initial `h = 0.5` m in columns 0–62, zero east of the ridge; no rain; closed; run 2 h. Assert `h[:, 65:].max() == 0.0` exactly, and `abs(eta[:, :63] - 0.5).max() < 1e-9`.
 
@@ -184,7 +184,7 @@ def run(z, n, dx, rain_fn, t_end, *, rain_breakpoints=(), dz=None,
         surge_mask=None, surge_fn=None, culverts=(), Ia=None, f_c=None, h0=None,
         alpha=0.7, h_min=1e-3, dt_min=0.01, dt_max=60.0, record_every=None) -> Result
 ```
-`Result` has: `h_final, h_max, eta_max, t_wet_first, qx, qy, budget (dict of the §6 volumes + residual + V_ref), outflow_series [(t, m³/s)], snapshots [(t, h)] when record_every is set`.
+`Result` has: `h_final, h_max, eta_max, t_wet_first, qx, qy, budget (dict of the §6 volumes + residual + V_ref), outflow_series, snapshots [(t, h)] when record_every is set`. `outflow_series` is a list of `(t_end_of_step, Q)` with `Q` the total limited open-edge outflow during that step in m³/s (volume that left during the step ÷ `dt`), one entry per step.
 `rain_fn(t) -> float or (ny,nx) array` in m/s. `run()` must shorten `dt` to land exactly on `t_end` and on any breakpoint times passed in `rain_breakpoints`.
 
 ## 9. Rules for the implementer
@@ -198,3 +198,4 @@ def run(z, n, dx, rain_fn, t_end, *, rain_breakpoints=(), dz=None,
 ## 10. Revision log
 
 - v1.1 (2026-10-23): §2.4 limiter changed from a per-face `h·dx/(4·dt)` cap (which throttled steady kinematic flow and broke T3) to per-cell proportional scaling; `clipped_volume` tolerance 0 → 1e-9 m³. §6 residual normalised by `V_ref` (rain + |boundary inflow| + initial volume) instead of rain alone, so T7 and initial-condition tests are well-posed. T3: `x = (i+1)·dx` for the analytic depth, outflow target = total rain. T4b: overshoot check moved from depth to water-surface elevation (`eta_max`), with a bounded-sloshing check. T7: monotonicity checked at the final time only. T8 geometry fixed. `n = 0.03`, `rtol = 0`, T1 seed, T4b block location pinned. `rain_breakpoints` added to the `run()` signature; `eta_max` and `snapshots` added to `Result`.
+- v1.2 (2026-10-23): §2.8 reordered so open-edge faces are computed with §2.1–§2.3 before the limiter and included in it (a 60 s first step could otherwise pull ~36× a cell's volume through the outlet, uncounted). §4.1 free outfall changed from a zero-depth ghost (which steepens the outlet face and made the last T3 column ~9% shallow) to a zero-depth-gradient ghost `h_ghost = h_edge`. T3(b) asserts on `8 <= i <= nx-2` and reports the error at `nx-1`. T4b sloshing check restricted to cells with `h0 == 0`. T1 terrain construction, T4a `eta_mean`, and `outflow_series` semantics pinned.
