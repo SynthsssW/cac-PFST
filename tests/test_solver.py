@@ -1,6 +1,6 @@
 """Tests T1–T8 from SOLVER_SPEC.md §7. Written before floodsolver/solver.py.
 
-Tolerances and constructions are copied verbatim from §7 (spec v1.2).
+Tolerances and constructions are copied verbatim from §7 (spec v1.3).
 
 The solver is imported inside each test so that, before solver.py exists, every
 test fails individually with ModuleNotFoundError rather than one collection error.
@@ -42,7 +42,7 @@ def _bowl():
     nx = ny = 129
     X, Y = _coords(ny, nx)
     xc = yc = 64 * DX
-    return 5e-4 * ((X - xc) ** 2 + (Y - yc) ** 2)
+    return 2e-5 * ((X - xc) ** 2 + (Y - yc) ** 2)
 
 
 def _dilate(mask):
@@ -198,7 +198,8 @@ def test_T4b_bowl_no_overshoot():
     wet = h > 0.01
     eta_eq = np.mean(eta[wet])
     dry0 = h0 == 0
-    assert res.eta_max.max() <= (z + h0).max() + 1e-9
+    ever_wet = res.h_max > 0.01
+    assert res.eta_max[ever_wet].max() <= (z + h0)[h0 > 0].max() + 1e-9
     assert res.eta_max[dry0 & wet].max() <= eta_eq + 0.10
     assert np.std(eta[wet]) < 1e-3
     assert _rel_residual(res.budget, h0) < 1e-10
@@ -247,13 +248,14 @@ def test_T6_no_uphill_wetting():
 def test_T7_dirichlet_surge():
     from floodsolver.solver import run
 
-    z = np.zeros((NY, NX))
+    X, _ = _coords(NY, NX)
+    z = 0.001 * X  # rises eastward; 1 m contour at i = 100
     n = np.full((NY, NX), N_MANNING)
     mask = np.zeros((NY, NX), dtype=bool)
     mask[:, 0] = True
     h0 = np.zeros((NY, NX))
     h0[:, 0] = 1.0
-    res = run(z, n, DX, lambda t: 0.0, 2 * 3600.0, h0=h0,
+    res = run(z, n, DX, lambda t: 0.0, 4 * 3600.0, h0=h0,
               surge_mask=mask, surge_fn=lambda t: 1.0,
               edges=CLOSED, alpha=ALPHA, h_min=H_MIN, record_every=60.0)
 
@@ -261,7 +263,17 @@ def test_T7_dirichlet_surge():
     assert len(frames) > 1
     for h in frames:
         assert np.all(h[:, 0] == 1.0)
-    assert np.all(np.diff(res.h_final, axis=1) <= 1e-9)
+
+    h = res.h_final
+    eta = z + h
+    wet = h > 0.01
+    assert np.std(eta[wet]) < 2e-3
+    assert abs(np.mean(eta[wet]) - 1.0) < 2e-3
+    # final wet footprint equals {z < 1.0} up to a one-cell boundary ring
+    A = z < 1.0
+    ring = _dilate(A) & ~_erode(A)
+    assert not np.any((wet ^ A) & ~ring)
+    assert np.abs(h - h[0:1, :]).max() <= 1e-12
     assert _rel_residual(res.budget, h0) < 1e-10
 
 
@@ -295,6 +307,8 @@ def test_T8_culvert():
     eta = z + res.h_final
     assert abs(eta[west].mean() - eta[east].mean()) < 1e-3
     assert _rel_residual(res.budget, h0) < 1e-10
+    assert res.budget["culvert_volume_ab"] >= 0
+    assert res.budget["culvert_volume_ba"] >= 0
 
     res_no = run(z, n, DX, lambda t: 0.0, t_end, h0=h0, culverts=(),
                  edges=CLOSED, alpha=ALPHA, h_min=H_MIN)
