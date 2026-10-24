@@ -98,7 +98,7 @@ h_ref  = max(h.max(), h_min)
 dt = alpha * dx / (u_max + sqrt(g * h_ref))
 dt = clip(dt, dt_min, dt_max)
 ```
-`alpha = 0.7`, `dt_min = 0.01`, `dt_max = 60.0` seconds. Recompute every step. The step must also be shortened so the simulation hits the requested end time and any forcing breakpoint (rain on/off) exactly.
+`alpha = 0.5`, `dt_min = 0.01`, `dt_max = 60.0` seconds. Recompute every step. (v1.3 review: θ = 0.8 with α = 0.7 grows a 2D checkerboard ≈ 2× per step; the 2D CFL on a square grid is 1/√2 even before θ. α = 0.5 is the standard conservative choice.) The step must also be shortened so the simulation hits the requested end time and any forcing breakpoint (rain on/off) exactly.
 
 ### 2.8 Order of operations inside `step()`
 
@@ -168,7 +168,7 @@ Relative residual `abs(residual)/V_ref` must be `< 1e-10` in every test.
 
 ## 7. Tests (write these first; tolerances are fixed)
 
-Common: `g = 9.81`, `dx = 10.0`, `alpha = 0.7`, `h_min = 1e-3`, `Ia = 0`, `f_c = 0`, grid 128×128 unless stated. Rain of 50 mm/hr = `1.3889e-5` m/s.
+Common: `g = 9.81`, `dx = 10.0`, `alpha = 0.5`, `theta = 0.8`, `h_min = 1e-3`, `Ia = 0`, `f_c = 0`, grid 128×128 unless stated. Rain of 50 mm/hr = `1.3889e-5` m/s.
 
 Manning `n = 0.03` everywhere in every test. "Relative residual" always means §6's `abs(residual)/V_ref`. Where a test says `allclose(..., atol=X)`, pass `rtol=0`.
 
@@ -176,11 +176,11 @@ Manning `n = 0.03` everywhere in every test. "Relative residual" always means §
 
 **T2 symmetry.** Paraboloid bowl `z = 2e-5 * ((x-xc)² + (y-yc)²)` (rim slope ≈ 0.026 — this scheme is for floodplain slopes; v1.2's `5e-4` bowl had rim slopes of 0.64) with `xc, yc` at the exact grid centre (use `nx = ny = 129` so there is a centre cell); uniform rain 50 mm/hr for 3600 s + 3600 s drain; closed. Assert `allclose(h, h[::-1, :], atol=1e-9)` and `allclose(h, h[:, ::-1], atol=1e-9)` and `allclose(h, h.T, atol=1e-9)`.
 
-**T3 tilted plane steady state.** Cell-centre coordinate `x_i = i*dx`; `z[j,i] = S0 * ((nx-1)*dx - x_i)` with `S0 = 0.01`, uniform in y, `n = 0.03`; east edge open, others closed; rain 50 mm/hr held constant for 4 h. Kinematic steady state: the flux through the east face of cell `i` is `q = r * (i+1) * dx` (distance from the closed west edge to that face), and the depth in cell `i` is the depth that carries that flux: `h_i = (n * r * (i+1) * dx / sqrt(S0))**(3/5)`. Use this `x = (i+1)*dx` in the analytic comparison. Assert at t = 4 h: (a) outflow rate (m³/s, last 10 min average) within 2% of the total rain rate `r * nx * ny * dx²`; (b) `h[j, i]` within 5% of `h_i` for all `8 <= i <= nx-2`, every row `j` (rows identical to 1e-12); additionally REPORT (do not assert) the relative error at `i = nx-1` — with the §4.1 zero-gradient ghost it should also be within ~2%, and a large value there means the boundary is wrong; (c) relative residual `< 1e-10`.
+**T3 tilted plane steady state.** Cell-centre coordinate `x_i = i*dx`; `z[j,i] = S0 * ((nx-1)*dx - x_i)` with `S0 = 0.01`, uniform in y, `n = 0.03`; east edge open, others closed; rain 50 mm/hr held constant for 4 h. Kinematic steady state: the flux through the east face of cell `i` is `q = r * (i+1) * dx` (distance from the closed west edge to that face), and the depth in cell `i` is the depth that carries that flux: `h_i = (n * r * (i+1) * dx / sqrt(S0))**(3/5)`. Use this `x = (i+1)*dx` in the analytic comparison. Assert at t = 4 h: (a) outflow rate (m³/s, last 10 min average) within 2% of the total rain rate `r * nx * ny * dx²`; (b) `h[j, i]` within 5% of `h_i` for all `8 <= i <= nx-2`, every row `j` (rows identical to 1e-12); additionally REPORT (do not assert) the relative error at `i = nx-1` — with the §4.1 explicit normal-depth outlet it should be well within 2%, and a large value there means the boundary is wrong; (c) relative residual `< 1e-10`.
 
 **T4a bowl flat surface.** Same bowl as T2, closed, rain 100 mm total over 1 h, then drain 6 h. Let `wet = h > 0.01`, `eta_mean = mean(eta[wet])`. Assert `std(eta[wet]) < 1e-3` m; wet footprint equals `{z < eta_mean}` up to a one-cell boundary ring (cells within one 8-neighbour step of the predicted edge); relative residual `< 1e-10`.
 
-**T4b bowl no overshoot.** Same bowl, no rain, initial `h0 = 2.0` m in rows and columns 60–69 inclusive, zero elsewhere, run 6 h. `run()` must also track `eta_max = max over time of (z_eff + h)` per cell. Let `eta_eq = mean(eta[h > 0.01])` at the end. Let `dry0 = (h0 == 0)`, `ever_wet = h_max > 0.01`. Assert: `eta_max[ever_wet].max() <= (z_eff + h0)[h0 > 0].max() + 1e-9` (no wet cell's surface ever rises above the initial maximum WATER surface — dry terrain is excluded from both sides); `eta_max[dry0 & (h > 0.01)].max() <= eta_eq + 0.10` (bounded sloshing overshoot, on cells that started dry — the block cells' own initial surfaces are excluded); final `std(eta[h > 0.01]) < 1e-3`; relative residual `< 1e-10`.
+**T4b bowl no overshoot.** Same bowl, no rain, initial `h0 = 2.0` m in rows and columns 60–69 inclusive, zero elsewhere, run 6 h. `run()` must also track `eta_max = max over time of (z_eff + h)` per cell. Let `eta_eq = mean(eta[h > 0.01])` at the end. Let `dry0 = (h0 == 0)`, `ever_wet = h_max > 0.01`. Assert: `eta_max[ever_wet].max() <= (z_eff + h0)[h0 > 0].max() + 1e-9` (no wet cell's surface ever rises above the initial maximum WATER surface — dry terrain is excluded from both sides); run with `record_every = 60` and, for every snapshot with `t >= 3600` s, `max(eta_snap[h_snap > 0.01]) <= eta_eq + 0.10` (bounded sloshing after the initial collapse — the dam-break transient itself legitimately reaches ~4/9 of the initial depth at the block edge, Ritter 1892, so `eta_max` over all time is NOT used for this check); final `std(eta[h > 0.01]) < 1e-3`; relative residual `< 1e-10`.
 
 **T5 dry ridge.** `z = 0` everywhere except a ridge `z = 1.0` in columns 63–64; initial `h = 0.5` m in columns 0–62, zero east of the ridge; no rain; closed; run 2 h. Assert `h[:, 65:].max() == 0.0` exactly, and `abs(eta[:, :63] - 0.5).max() < 1e-9`.
 
@@ -197,7 +197,7 @@ def step(h, qx, qy, z_eff, n, dx, dt, rain, params, bc, state) -> (h, qx, qy, st
 def run(z, n, dx, rain_fn, t_end, *, rain_breakpoints=(), dz=None,
         edges={"N":"closed","S":"closed","E":"closed","W":"closed"},
         surge_mask=None, surge_fn=None, culverts=(), Ia=None, f_c=None, h0=None,
-        alpha=0.7, theta=0.8, h_min=1e-3, dt_min=0.01, dt_max=60.0, record_every=None) -> Result
+        alpha=0.5, theta=0.8, h_min=1e-3, dt_min=0.01, dt_max=60.0, record_every=None) -> Result
 ```
 `Result` has: `h_final, h_max, eta_max, t_wet_first, qx, qy, budget (dict of the §6 volumes + residual + V_ref), outflow_series, snapshots [(t, h)] when record_every is set`. `outflow_series` is a list of `(t_end_of_step, Q)` with `Q` the total limited open-edge outflow during that step in m³/s (volume that left during the step ÷ `dt`), one entry per step.
 `rain_fn(t) -> float or (ny,nx) array` in m/s. `run()` must shorten `dt` to land exactly on `t_end` and on any breakpoint times passed in `rain_breakpoints`.
@@ -225,3 +225,4 @@ def run(z, n, dx, rain_fn, t_end, *, rain_breakpoints=(), dz=None,
   - T4b first assertion restricted to ever-wet cells vs initial wet surface (the v1.2 form was vacuous).
   - T7 rewritten as a surge-extent test on a tilted plain (final footprint = 1 m contour) instead of monotonicity after 2 h of undamped sloshing in a closed flat box.
   - §9: diagnostics are committed under `diagnostics/`.
+- v1.4 (2026-10-23): α 0.7 → 0.5 (θ = 0.8 at α = 0.7 unstable in 2D, checkerboard growth ≈ 2×/step; found in Phase-2 review). T4b sloshing bound applied to snapshots at t ≥ 1 h only; the dam-break transient exceeds it legitimately. Stale T3 note about the ghost outlet fixed.

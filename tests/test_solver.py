@@ -1,6 +1,6 @@
 """Tests T1–T8 from SOLVER_SPEC.md §7. Written before floodsolver/solver.py.
 
-Tolerances and constructions are copied verbatim from §7 (spec v1.3).
+Tolerances and constructions are copied verbatim from §7 (spec v1.4).
 
 The solver is imported inside each test so that, before solver.py exists, every
 test fails individually with ModuleNotFoundError rather than one collection error.
@@ -12,7 +12,8 @@ from floodsolver.analytic import tilted_plane_steady_h
 # §7 common parameters
 G = 9.81
 DX = 10.0
-ALPHA = 0.7
+ALPHA = 0.5
+THETA = 0.8
 H_MIN = 1e-3
 NX = NY = 128
 RAIN_50MM_HR = 50e-3 / 3600.0  # 50 mm/hr = 1.3889e-5 m/s
@@ -79,7 +80,7 @@ def test_T1_mass_conservation():
 
     t_rain = 3600.0
     res = run(z, n, DX, lambda t: RAIN_50MM_HR if t < t_rain else 0.0, t_rain + 7200.0,
-              edges=CLOSED, alpha=ALPHA, h_min=H_MIN, rain_breakpoints=[t_rain])
+              edges=CLOSED, alpha=ALPHA, theta=THETA, h_min=H_MIN, rain_breakpoints=[t_rain])
 
     h = res.h_final
     rain_volume = RAIN_50MM_HR * t_rain * NX * NY * DX ** 2
@@ -99,7 +100,7 @@ def test_T2_symmetry():
     n = np.full(z.shape, N_MANNING)
     t_rain = 3600.0
     res = run(z, n, DX, lambda t: RAIN_50MM_HR if t < t_rain else 0.0, t_rain + 3600.0,
-              edges=CLOSED, alpha=ALPHA, h_min=H_MIN, rain_breakpoints=[t_rain])
+              edges=CLOSED, alpha=ALPHA, theta=THETA, h_min=H_MIN, rain_breakpoints=[t_rain])
 
     h = res.h_final
     assert np.allclose(h, h[::-1, :], rtol=0, atol=1e-9)
@@ -122,7 +123,7 @@ def test_T3_tilted_plane_steady_state():
     t_end = 4 * 3600.0
     edges = {"N": "closed", "S": "closed", "E": "open", "W": "closed"}
 
-    res = run(z, n, DX, lambda t: r, t_end, edges=edges, alpha=ALPHA, h_min=H_MIN)
+    res = run(z, n, DX, lambda t: r, t_end, edges=edges, alpha=ALPHA, theta=THETA, h_min=H_MIN)
 
     # (a) outflow rate, time-weighted average over the last 10 min.
     # §8: outflow_series is one (t_end_of_step, volume out that step / dt) per step.
@@ -162,7 +163,7 @@ def test_T4a_bowl_flat_surface():
     t_rain = 3600.0
     r = 100e-3 / t_rain  # 100 mm total over 1 h
     res = run(z, n, DX, lambda t: r if t < t_rain else 0.0, t_rain + 6 * 3600.0,
-              edges=CLOSED, alpha=ALPHA, h_min=H_MIN, rain_breakpoints=[t_rain])
+              edges=CLOSED, alpha=ALPHA, theta=THETA, h_min=H_MIN, rain_breakpoints=[t_rain])
 
     h = res.h_final
     eta = z + h
@@ -191,16 +192,19 @@ def test_T4b_bowl_no_overshoot():
     h0 = np.zeros(z.shape)
     h0[60:70, 60:70] = 2.0  # rows and columns 60-69 inclusive
     res = run(z, n, DX, lambda t: 0.0, 6 * 3600.0, h0=h0,
-              edges=CLOSED, alpha=ALPHA, h_min=H_MIN)
+              edges=CLOSED, alpha=ALPHA, theta=THETA, h_min=H_MIN, record_every=60.0)
 
     h = res.h_final
     eta = z + h
     wet = h > 0.01
     eta_eq = np.mean(eta[wet])
-    dry0 = h0 == 0
     ever_wet = res.h_max > 0.01
     assert res.eta_max[ever_wet].max() <= (z + h0)[h0 > 0].max() + 1e-9
-    assert res.eta_max[dry0 & wet].max() <= eta_eq + 0.10
+    # bounded sloshing after the initial collapse: snapshots at t >= 3600 s
+    late = [(t, hs) for t, hs in res.snapshots if t >= 3600.0]
+    assert len(late) > 0
+    for t, hs in late:
+        assert np.max((z + hs)[hs > 0.01]) <= eta_eq + 0.10
     assert np.std(eta[wet]) < 1e-3
     assert _rel_residual(res.budget, h0) < 1e-10
 
@@ -217,7 +221,7 @@ def test_T5_dry_ridge():
     h0[:, 0:63] = 0.5
     n = np.full((NY, NX), N_MANNING)
     res = run(z, n, DX, lambda t: 0.0, 2 * 3600.0, h0=h0,
-              edges=CLOSED, alpha=ALPHA, h_min=H_MIN)
+              edges=CLOSED, alpha=ALPHA, theta=THETA, h_min=H_MIN)
 
     h = res.h_final
     eta = z + h
@@ -237,7 +241,7 @@ def test_T6_no_uphill_wetting():
     h0[:, 0] = 0.2
     n = np.full((NY, NX), N_MANNING)
     res = run(z, n, DX, lambda t: 0.0, 3600.0, h0=h0,
-              edges=CLOSED, alpha=ALPHA, h_min=H_MIN)
+              edges=CLOSED, alpha=ALPHA, theta=THETA, h_min=H_MIN)
 
     assert res.h_final[:, 1:].max() == 0.0
 
@@ -257,7 +261,7 @@ def test_T7_dirichlet_surge():
     h0[:, 0] = 1.0
     res = run(z, n, DX, lambda t: 0.0, 4 * 3600.0, h0=h0,
               surge_mask=mask, surge_fn=lambda t: 1.0,
-              edges=CLOSED, alpha=ALPHA, h_min=H_MIN, record_every=60.0)
+              edges=CLOSED, alpha=ALPHA, theta=THETA, h_min=H_MIN, record_every=60.0)
 
     frames = [h for _, h in res.snapshots]
     assert len(frames) > 1
@@ -303,7 +307,7 @@ def test_T8_culvert():
     t_end = 6 * 3600.0
 
     res = run(z, n, DX, lambda t: 0.0, t_end, h0=h0, culverts=[link],
-              edges=CLOSED, alpha=ALPHA, h_min=H_MIN)
+              edges=CLOSED, alpha=ALPHA, theta=THETA, h_min=H_MIN)
     eta = z + res.h_final
     assert abs(eta[west].mean() - eta[east].mean()) < 1e-3
     assert _rel_residual(res.budget, h0) < 1e-10
@@ -311,5 +315,5 @@ def test_T8_culvert():
     assert res.budget["culvert_volume_ba"] >= 0
 
     res_no = run(z, n, DX, lambda t: 0.0, t_end, h0=h0, culverts=(),
-                 edges=CLOSED, alpha=ALPHA, h_min=H_MIN)
+                 edges=CLOSED, alpha=ALPHA, theta=THETA, h_min=H_MIN)
     assert res_no.h_final[east].max() == 0.0
